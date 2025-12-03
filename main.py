@@ -9,15 +9,15 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.callbacks import EvalCallback, BaseCallback, CallbackList
 from collections import deque
-
-def make_env(env_id):
+import airsim
+def make_env(env_id, drone_id, client):
     """
     Gymnasium reset -> (obs, info)
     step -> (obs, reward, terminated, truncated, info)
     Monitor 自動產生 info["episode"]
     """
     def _init():
-        env = gym.make(env_id)
+        env = gym.make(env_id, drone_id=drone_id, client=client)
         env = Monitor(env)
         return env
     return _init
@@ -36,7 +36,7 @@ def parse_args():
     p.add_argument("--n_steps", type=int, default=2048)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--clip_range", type=float, default=0.2)
-    p.add_argument("--hidden", type=int, default=256)
+    p.add_argument("--hidden", type=int, default=128)
 
     # --- Episode based checkpoint ---
     p.add_argument("--save_every_ep", type=int, default=50)
@@ -50,36 +50,91 @@ def parse_args():
 
 
 class FunctionCallback(BaseCallback):
-    def __init__(self,func, verbose=0):
+    def __init__(self, verbose=0):
         super().__init__(verbose)
-        self.func=func
+        self.ep_rewards = deque(maxlen=100)
+        self.ep_lengths = deque(maxlen=100)
 
-    def _on_step(self):
-        return self.func(self.locals, self.globals)
+    def _on_step(self) -> bool:
+        infos = self.locals["infos"]
+        for info in infos:
+            if "episode" in info:
+                r = info["episode"]["r"]
+                l = info["episode"]["l"]
+                self.ep_rewards.append(r)
+                self.ep_lengths.append(l)
+
+                
+                self.logger.record("rollout/ep_reward", r)
+                self.logger.record("rollout/ep_length", l)
+
+        mean_r = sum(self.ep_rewards) / len(self.ep_rewards) if self.ep_rewards else 0
+        mean_l = sum(self.ep_lengths) / len(self.ep_lengths) if self.ep_lengths else 0
+        if self.ep_rewards:
+            self.logger.record("rollout/mean_reward", mean_r)
+            self.logger.record("rollout/mean_length", mean_l)
+
+        # 每 100 steps dump 到 tensorboard
+        if self.num_timesteps % 100 == 0:
+            self.logger.dump(self.num_timesteps)
+
+        # 同時輸出到 stdout
+        sys.stdout.write(f'\rtotal steps = {self.num_timesteps} | MeanR={mean_r:.2f} | MeanL={mean_l:.1f}')
+        sys.stdout.flush()
+
+        return True
+
 
 def main():
     args = parse_args()
     print(f'env_id : {args.env_id}')
-    input()
     os.makedirs(args.log_dir, exist_ok=True)
     save_dir = os.path.join(args.log_dir, "episode_models")
     os.makedirs(save_dir, exist_ok=True)
 
-    # Logger：不要 CSV，只要 stdout + tensorboard
-    logger = configure(args.log_dir, ["tensorboard"])
 
-    # Training env（Gymnasium）
-    env = DummyVecEnv([make_env(args.env_id)])
+    # 建立連線
+    client = airsim.MultirotorClient()
+    client.confirmConnection()
+    print(f'connect confirm!')
     
+    client.reset()
+    print(f'reset env')
     
-    # Eval env
-    env_eval = DummyVecEnv([make_env(args.env_id)])
+    input(f'press enter to start!')
+
+    Drones = ["Drone1", "Drone2"]
+    # 啟用 API 控制 & 解鎖
+    for d in Drones:
+        client.enableApiControl(True, vehicle_name=d)
+        client.armDisarm(True, vehicle_name=d)
+
+    env_fns = [make_env(args.env_id, drone_id=drone_name, client=client) for drone_name in Drones]
+    
+    env_base = DummyVecEnv(env_fns)
+
+    env = VecMonitor(env_base)
+
+    # # Training env（Gymnasium）
+    # env = DummyVecEnv([make_env(args.env_id)])
+    
+    # --- Eval env (通常只需要一個環境進行評估) ---
+    # 評估環境使用第一個 ID，或者一個單獨的 ID (例如 "EvalDrone")
+    eval_drone_id = "EvalDrone"
+    client.enableApiControl(True, vehicle_name="EvalDrone")
+    client.armDisarm(True, vehicle_name="EvalDrone")
+    env_eval_fns = [make_env(args.env_id, drone_id=eval_drone_id, client=client)]
+    env_eval_base = DummyVecEnv(env_eval_fns)
+    env_eval = VecMonitor(env_eval_base)
+
+
+
 
     eval_callback = EvalCallback(
         env_eval,
         best_model_save_path='./logs',
         n_eval_episodes=5,
-        eval_freq=100,
+        eval_freq=10000,
         deterministic=True,
         render=False,
         verbose=0,
@@ -94,7 +149,7 @@ def main():
     if args.resume and os.path.exists(args.resume):
         print(f"[INFO] Resuming from {args.resume}")
         model = PPO.load(args.resume, env=env)
-        model.set_logger(logger)
+        
     else:
         model = PPO(
             "MlpPolicy",
@@ -109,7 +164,7 @@ def main():
             tensorboard_log=args.log_dir,
             device='cpu'
         )
-        model.set_logger(logger)
+        
 
     print("[INFO] Start training...")
     print(f"[PARAM] lr={args.lr}, gamma={args.gamma}, n_steps={args.n_steps}, batch={args.batch_size}")
@@ -117,30 +172,13 @@ def main():
 
     ep_rewards = deque(maxlen=100)
     ep_lengths = deque(maxlen=100)
-    def callback(locals_, globals_):
-        step = model.num_timesteps
-        r = None
-        l = None
-        infos = locals_["infos"]
-        for info in infos:
-            if "episode" in info:
-                r = info["episode"]["r"]
-                l = info["episode"]["l"]
-                ep_rewards.append(r)
-                ep_lengths.append(l)
 
-        mean_r = sum(ep_rewards) / len(ep_rewards) if ep_rewards else 0
-        mean_l = sum(ep_lengths) / len(ep_lengths) if ep_lengths else 0
-        sys.stdout.write(f'\rtotal steps = {step} | MeanR={mean_r:.2f} | MeanL={mean_l:.1f}')
-        sys.stdout.flush()
-
-        return True
-    cb = FunctionCallback(callback)
+    cb = FunctionCallback()
     cb_list = CallbackList([cb, eval_callback])
     # Train
     model.learn(
         total_timesteps=args.total_steps,
-        callback=callback,
+        callback=cb_list,
     
     )
 
@@ -152,4 +190,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
