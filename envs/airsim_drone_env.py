@@ -3,6 +3,7 @@ import numpy as np
 import math
 import gymnasium as gym
 from gymnasium import spaces
+import sys
 class AirSimDroneEnv(gym.Env):
 
     metadata = {
@@ -21,7 +22,7 @@ class AirSimDroneEnv(gym.Env):
         self.max_episode_steps = max_episode_steps
         self.step_length = step_length
         self.steps = 0
-
+        self.episode_steps_counter = 0
         self.state = {
             "position": np.zeros(3),
             "collision": False,
@@ -88,15 +89,27 @@ class AirSimDroneEnv(gym.Env):
     def _compute_reward(self):
         reward = 0
         done = False
-        target = np.array([0.0, 0.0, -2.0])
-
         position = self.state["position"]
+        target = np.array([0.0, 0.0, -8])
+        if self.episode_steps_counter <= 20000:        
+            dist_to_target = np.linalg.norm(position - target)
+            reward = -dist_to_target + 6.0
+        elif self.episode_steps_counter <= 50000:
+            dist_to_target = np.linalg.norm(position - target)
+            reward = -dist_to_target + 3.0
+        else:
+            dist_to_target = np.linalg.norm(position - target)
+            reward = -dist_to_target + 1.0
+    
         dist_to_target = np.linalg.norm(position - target)
-        print(f'poisition : {position}')
-        print(f'dist_to_target : {dist_to_target}')
-        reward = -dist_to_target + 1.0
-        print(f'reward : {reward}')
-        print(f'steps : {self.steps}')
+           
+        if dist_to_target <= 0.5:
+            reward += 50
+        #print(f'poisition : {position}')
+        #print(f'dist_to_target : {dist_to_target}')
+        #reward = -dist_to_target + 3.0
+        #print(f'reward : {reward}')
+        #print(f'steps : {self.steps}')
 
         if self.state["collision"]:
             reward = -100
@@ -110,8 +123,11 @@ class AirSimDroneEnv(gym.Env):
     def step(self, action):
         self._do_action(action)
         self.steps += 1
+        self.episode_steps_counter += 1
         obs = self._get_obs()
         reward, done = self._compute_reward()
+        #sys.stdout.write(f'\repisode_steps_counter : {self.episode_steps_counter}')
+        #sys.stdout.flush()
         return obs, reward, done, False, self.state
 
     def reset(self, seed=None, options=None):

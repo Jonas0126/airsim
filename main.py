@@ -2,11 +2,13 @@ import os
 import gymnasium as gym
 import argparse
 import envs
+import sys
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from stable_baselines3.common.logger import configure
-
+from stable_baselines3.common.callbacks import EvalCallback, BaseCallback, CallbackList
+from collections import deque
 
 def make_env(env_id):
     """
@@ -46,6 +48,15 @@ def parse_args():
     return p.parse_args()
 
 
+
+class FunctionCallback(BaseCallback):
+    def __init__(self,func, verbose=0):
+        super().__init__(verbose)
+        self.func=func
+
+    def _on_step(self):
+        return self.func(self.locals, self.globals)
+
 def main():
     args = parse_args()
     print(f'env_id : {args.env_id}')
@@ -55,11 +66,25 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
 
     # Logger：不要 CSV，只要 stdout + tensorboard
-    logger = configure(args.log_dir, ["stdout", "tensorboard"])
+    logger = configure(args.log_dir, ["tensorboard"])
 
     # Training env（Gymnasium）
     env = DummyVecEnv([make_env(args.env_id)])
-    #env = VecMonitor(env)
+    
+    
+    # Eval env
+    env_eval = DummyVecEnv([make_env(args.env_id)])
+
+    eval_callback = EvalCallback(
+        env_eval,
+        best_model_save_path='./logs',
+        n_eval_episodes=5,
+        eval_freq=100,
+        deterministic=True,
+        render=False,
+        verbose=0,
+    )
+
 
     # 建立或載入模型
     policy_kwargs = dict(
@@ -80,7 +105,7 @@ def main():
             batch_size=args.batch_size,
             clip_range=args.clip_range,
             policy_kwargs=policy_kwargs,
-            verbose=2,
+            verbose=0,
             tensorboard_log=args.log_dir,
             device='cpu'
         )
@@ -89,33 +114,34 @@ def main():
     print("[INFO] Start training...")
     print(f"[PARAM] lr={args.lr}, gamma={args.gamma}, n_steps={args.n_steps}, batch={args.batch_size}")
 
-    episode_counter = 0
 
-    # Episode callback
+    ep_rewards = deque(maxlen=100)
+    ep_lengths = deque(maxlen=100)
     def callback(locals_, globals_):
-        nonlocal episode_counter
+        step = model.num_timesteps
+        r = None
+        l = None
         infos = locals_["infos"]
-
         for info in infos:
             if "episode" in info:
                 r = info["episode"]["r"]
                 l = info["episode"]["l"]
-                episode_counter += 1
+                ep_rewards.append(r)
+                ep_lengths.append(l)
 
-                print(f"[Episode {episode_counter}] reward={r:.2f}, length={l}")
-
-                # Episode-based checkpoint
-                if episode_counter % args.save_every_ep == 0:
-                    save_path = os.path.join(save_dir, f"ppo_ep{episode_counter}.zip")
-                    model.save(save_path)
-                    print(f"[SAVE] {save_path}")
+        mean_r = sum(ep_rewards) / len(ep_rewards) if ep_rewards else 0
+        mean_l = sum(ep_lengths) / len(ep_lengths) if ep_lengths else 0
+        sys.stdout.write(f'\rtotal steps = {step} | MeanR={mean_r:.2f} | MeanL={mean_l:.1f}')
+        sys.stdout.flush()
 
         return True
-
+    cb = FunctionCallback(callback)
+    cb_list = CallbackList([cb, eval_callback])
     # Train
     model.learn(
         total_timesteps=args.total_steps,
-        callback=callback
+        callback=callback,
+    
     )
 
     # Save final model

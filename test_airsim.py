@@ -24,7 +24,7 @@ try:
         # 取得當前位置
         state = client.getMultirotorState()
         z = state.kinematics_estimated.position.z_val
-
+        print(f'-1.46 - z : {-1.46 - z}')
         # 如果未到目標高度，繼續往上
         if z > target_altitude:
             client.moveByVelocityAsync(0, 0, -ascend_speed, 1)
