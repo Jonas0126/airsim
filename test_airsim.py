@@ -2,7 +2,7 @@ import airsim
 import time
 
 # 連接到 AirSim
-client = airsim.MultirotorClient()
+client = airsim.MultirotorClient(port=41452)
 client.confirmConnection()
 
 # 取得控制權
